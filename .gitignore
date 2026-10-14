@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Training artifacts (keep on server, not in repo)
+data/
+checkpoints/
+output/
+*.pth
+*.pt
+
+# Local / IDE
+.env
+.venv/
+venv/
+*.swp
+.idea/
+.vscode/
