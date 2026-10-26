@@ -206,7 +206,7 @@ class MaskDecoder_512(nn.Module):
             up_i = self.output_upscaling(organ_feats[i])
             hyper_w = self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
             bi, ci, hi, wi = up_i.shape
-            mask_i = (hyper_w @ up_i.view(bi, ci, hi * wi)).view(bi, 1, hi, wi)
+            mask_i = (hyper_w.unsqueeze(1) @ up_i.view(bi, ci, hi * wi)).view(bi, 1, hi, wi)
             masks_list.append(mask_i)
         masks = torch.cat(masks_list, dim=1)
         # masks_sam = (hyper_in[:,:self.num_mask_tokens-1] @ upscaled_embedding_sam.view(b, c, h * w)).view(b, -1, h, w)

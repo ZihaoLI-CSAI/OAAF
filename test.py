@@ -117,10 +117,20 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if args.config is not None:
-        # overwtite default configurations with config file\
         config_dict = config_to_dict(args.config)
+        _config_int_keys = {
+            'num_classes', 'img_size', 'input_size', 'seed', 'deterministic', 'rank', 'stage',
+        }
         for key in config_dict:
-            setattr(args, key, config_dict[key])
+            if not hasattr(args, key):
+                continue
+            value = config_dict[key]
+            if key in _config_int_keys:
+                setattr(args, key, int(value))
+            elif value in ('True', 'False'):
+                setattr(args, key, value == 'True')
+            else:
+                setattr(args, key, value)
 
     if not args.deterministic:
         cudnn.benchmark = True
