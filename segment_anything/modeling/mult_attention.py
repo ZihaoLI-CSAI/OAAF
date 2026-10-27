@@ -260,29 +260,3 @@ class CIF_block(nn.Module):   #ASIF
         h = h * self.cha(l)
         out = l + h
         return out
-
-
-class OrganAwareFusion(nn.Module):
-    """Organ-aware adaptive fusion (OAAF): per-token blend of deep and AWFFM features."""
-
-    def __init__(self, dim=256, num_tokens=9):
-        super().__init__()
-        self.att = CIF_block(dim)
-        self.alpha_mlp = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(dim, 64),
-                nn.ReLU(inplace=True),
-                nn.Linear(64, 1),
-                nn.Sigmoid(),
-            )
-            for _ in range(num_tokens)
-        ])
-
-    def forward(self, l_deep, h, mask_tokens_out):
-        fused_base = self.att(l_deep, h)
-        organ_feats = []
-        for i in range(mask_tokens_out.shape[1]):
-            alpha = self.alpha_mlp[i](mask_tokens_out[:, i, :]).view(-1, 1, 1, 1)
-            feat_i = alpha * l_deep + (1.0 - alpha) * fused_base
-            organ_feats.append(feat_i)
-        return organ_feats

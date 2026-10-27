@@ -16,7 +16,7 @@ from torch import Tensor
 import math
 import numpy as np
 from .utils import noise_list
-from .mult_attention import OrganAwareFusion
+from .mult_attention import CIF_block
 
 
 class MaskDecoder_512(nn.Module):
@@ -100,7 +100,7 @@ class MaskDecoder_512(nn.Module):
                                         LayerNorm2d(transformer_dim // 4),
                                         nn.GELU(),
                                         nn.Conv2d(transformer_dim // 4, transformer_dim // 8, 3, 1, 1))
-        self.oaaf = OrganAwareFusion(dim=transformer_dim, num_tokens=self.num_mask_tokens)
+        self.Att = CIF_block(256)
 
     def forward(
         self,
@@ -181,6 +181,17 @@ class MaskDecoder_512(nn.Module):
         output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)  #torch.Size([1, 11, 256])
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)  #torch.Size([1, 11, 256])
 
+        ### 结果很好
+        src=self.Att(image_embeddings,hq_features)
+        ###
+        # ###
+        # src=self.Att(image_embeddings,hq_features3)   #结果很差
+        # src=self.Att(image_embeddings,hq_features2)
+        # src=self.Att(image_embeddings,hq_features)
+        # ###
+        # Expand per-image data in batch direction to be per-mask
+        # src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
+        # src = src + dense_prompt_embeddings
         src = image_embeddings + dense_prompt_embeddings  #torch.Size([8, 256, 32, 32])
         pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
         b, c, h, w = src.shape
@@ -197,18 +208,28 @@ class MaskDecoder_512(nn.Module):
         # Generate mask quality predictions
         iou_pred = self.iou_prediction_head(iou_token_out)
 
-        # OAAF: per-organ feature maps, then shared upscaling + hypernetwork
-        l_deep = src.transpose(1, 2).view(b, c, h, w)   # [B, 256, 32, 32], before AWFFM
-        organ_feats = self.oaaf(l_deep, hq_features, mask_tokens_out)
+        # Upscale mask embeddings and predict masks using the mask tokens
+        src = src.transpose(1, 2).view(b, c, h, w)   #torch.Size([8, 256, 32, 32])
+        src=self.Att(src,hq_features)  #ASIF+ASIF
+        upscaled_embedding = self.output_upscaling(src)  #torch.Size([8, 32, 128, 128])
+        # upscaled_embedding_sam = self.output_upscaling(src)  #torch.Size([8, 32, 128, 128])
+        ## upscaled_embedding_hq = self.embedding_maskfeature(upscaled_embedding_sam) + hq_features.repeat(b,1,1,1)
+        # upscaled_embedding_hq = self.embedding_maskfeature(upscaled_embedding_sam) + hq_features2+hq_features3
 
-        masks_list: List[torch.Tensor] = []
+
+        hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
-            up_i = self.output_upscaling(organ_feats[i])
-            hyper_w = self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
-            bi, ci, hi, wi = up_i.shape
-            mask_i = (hyper_w.unsqueeze(1) @ up_i.view(bi, ci, hi * wi)).view(bi, 1, hi, wi)
-            masks_list.append(mask_i)
-        masks = torch.cat(masks_list, dim=1)
+            hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
+        # for i in range(self.num_mask_tokens):
+        #     if i < self.num_mask_tokens - 1:
+        #         hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
+        #     else:
+        #         hyper_in_list.append(self.hf_mlp(mask_tokens_out[:, i, :]))
+        hyper_in = torch.stack(hyper_in_list, dim=1)  # [b, c, token_num]
+
+
+        b, c, h, w = upscaled_embedding.shape  # [h, token_num, h, w]
+        masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)  # [1, 4, 256, 256], 256 = 4 * 64, the size of image embeddings
         # masks_sam = (hyper_in[:,:self.num_mask_tokens-1] @ upscaled_embedding_sam.view(b, c, h * w)).view(b, -1, h, w)
         # masks_sam_hq = (hyper_in[:,self.num_mask_tokens-1:] @ upscaled_embedding_hq.view(b, c, h * w)).view(b, -1, h, w)
         # masks = torch.cat([masks_sam,masks_sam_hq],dim=1)
