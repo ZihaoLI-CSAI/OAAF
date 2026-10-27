@@ -55,6 +55,24 @@ parser.add_argument('--warmup_period', type=int, default=250,
 parser.add_argument('--AdamW', action='store_true', help='If activated, use AdamW to finetune SAM model')
 parser.add_argument('--module', type=str, default='sam_lora_image_encoder')
 parser.add_argument('--dice_param', type=float, default=0.9)
+# Phase B baseline patches (see 汇报/HF-SAM-baseline-patches.md)
+parser.add_argument('--lambda_hi', type=float, default=0.3,
+                    help='512 full-res auxiliary loss weight; 0 disables B2')
+parser.add_argument('--preserve_small_low_res', type=int, default=1,
+                    help='1: B1 block downsample that keeps small organs in low_res labels')
+parser.add_argument('--use_class_weight_ce', type=int, default=1,
+                    help='1: B3 weighted CrossEntropy')
+parser.add_argument('--ce_bg_weight', type=float, default=0.4,
+                    help='CE weight for background class 0')
+parser.add_argument('--ce_small_organ_weight', type=float, default=1.75,
+                    help='CE weight for gallbladder (4) and pancreas (8)')
+parser.add_argument('--dice_fg_only', type=int, default=1,
+                    help='1: B4 Dice averaged over organ classes 1-8 only')
+# Phase C (see 汇报/HF-SAM-baseline-patches.md)
+parser.add_argument('--oversample_small_organs', type=int, default=1,
+                    help='1: WeightedRandomSampler boosts slices with class 4 or 8')
+parser.add_argument('--small_slice_weight', type=float, default=4.0,
+                    help='Sampling weight for slices containing gallbladder or pancreas')
 args = parser.parse_args()
 
 if __name__ == "__main__":

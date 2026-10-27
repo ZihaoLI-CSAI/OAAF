@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 from tensorboardX import SummaryWriter
 from torch.nn.modules.loss import CrossEntropyLoss, CosineEmbeddingLoss
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.nn.functional as F
 from tqdm import tqdm
 from utils import DiceLoss, Focal_loss
@@ -48,12 +48,44 @@ def torch2D_Hausdorff_distance(x,y): # Input be like (Batch,width,height)
 #     loss_dice = dice_loss(low_res_logits, low_res_label_batch, softmax=True)
 #     loss = (1 - dice_weight) * loss_ce + dice_weight * loss_dice
 #     return loss, loss_ce, loss_dice
-def calc_loss(outputs, low_res_label_batch, ce_loss, dice_loss, dice_weight:float=0.8):
-    low_res_logits = outputs['low_res_logits']
-    loss_ce = ce_loss(low_res_logits, low_res_label_batch[:].long())
-    loss_dice = dice_loss(low_res_logits, low_res_label_batch, softmax=True)
-    loss = ((1 - dice_weight) * loss_ce + dice_weight * loss_dice)
+def build_ce_class_weights(num_classes, bg_weight, small_organ_weight, device):
+    """Phase B3: 9-way CE weights (0=background, 1-8 organs)."""
+    n = num_classes + 1
+    w = torch.ones(n, dtype=torch.float32, device=device)
+    w[0] = bg_weight
+    if n > 4:
+        w[4] = small_organ_weight
+    if n > 8:
+        w[8] = small_organ_weight
+    return w
+
+
+def build_dice_class_weights(num_classes, dice_fg_only):
+    """Phase B4: optional zero weight on background channel in Dice."""
+    n = num_classes + 1
+    if not dice_fg_only:
+        return None
+    w = [0.0] + [1.0] * num_classes
+    return w
+
+
+def calc_loss(logits, label_batch, ce_loss, dice_loss, dice_weight: float = 0.8, dice_class_weights=None):
+    loss_ce = ce_loss(logits, label_batch[:].long())
+    loss_dice = dice_loss(logits, label_batch, softmax=True, weight=dice_class_weights)
+    loss = (1 - dice_weight) * loss_ce + dice_weight * loss_dice
     return loss, loss_ce, loss_dice
+
+
+def calc_train_loss(outputs, low_res_label_batch, full_res_label_batch, ce_loss, dice_loss,
+                    dice_weight: float, lambda_hi: float, dice_class_weights=None):
+    loss_lo, loss_ce_lo, loss_dice_lo = calc_loss(
+        outputs['low_res_logits'], low_res_label_batch, ce_loss, dice_loss, dice_weight, dice_class_weights)
+    if lambda_hi <= 0:
+        return loss_lo, loss_ce_lo, loss_dice_lo, None, None, None
+    loss_hi, loss_ce_hi, loss_dice_hi = calc_loss(
+        outputs['masks'], full_res_label_batch, ce_loss, dice_loss, dice_weight, dice_class_weights)
+    loss = (1.0 - lambda_hi) * loss_lo + lambda_hi * loss_hi
+    return loss, loss_ce_lo, loss_dice_lo, loss_ce_hi, loss_dice_hi, loss_hi
 
 class AddGaussianNoise(object):
 
@@ -118,17 +150,37 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
     num_classes = args.num_classes
     batch_size = args.batch_size * args.n_gpu
     # max_iterations = args.max_iterations
+    preserve_small = bool(getattr(args, 'preserve_small_low_res', 1))
     db_train = Synapse_dataset(base_dir=args.root_path, list_dir=args.list_dir, split=args.split,
                                transform=transforms.Compose(
-                                   [RandomGenerator(output_size=[args.img_size, args.img_size], low_res=[low_res, low_res])
+                                   [RandomGenerator(output_size=[args.img_size, args.img_size],
+                                                      low_res=[low_res, low_res],
+                                                      preserve_small_low_res=preserve_small)
                                    ]))
     print("The length of train set is: {}".format(len(db_train)))
 
     def worker_init_fn(worker_id):
         random.seed(args.seed + worker_id)
 
-    trainloader = DataLoader(db_train, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True,
-                             worker_init_fn=worker_init_fn)
+    use_oversample = bool(getattr(args, 'oversample_small_organs', 1))
+    if use_oversample and args.split == 'train':
+        from datasets.dataset_synapse import build_train_slice_sample_weights
+        sample_weights, ow_stats = build_train_slice_sample_weights(
+            args.root_path, args.list_dir, args.split,
+            small_classes=(4, 8), small_weight=float(args.small_slice_weight))
+        logging.info(
+            'Phase C oversample: %d / %d train slices contain class 4 or 8; weight=%s',
+            ow_stats['small_organ_slices'], ow_stats['total'], ow_stats['small_weight'])
+        weight_tensor = torch.as_tensor(sample_weights, dtype=torch.double)
+        sampler = WeightedRandomSampler(
+            weight_tensor, num_samples=len(db_train), replacement=True)
+        trainloader = DataLoader(
+            db_train, batch_size=batch_size, shuffle=False, sampler=sampler,
+            num_workers=8, pin_memory=True, worker_init_fn=worker_init_fn)
+    else:
+        trainloader = DataLoader(
+            db_train, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True,
+            worker_init_fn=worker_init_fn)
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
         # model = model.module
@@ -138,10 +190,23 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
     model_grad_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('model_grad_params:' + str(model_grad_params), '\nmodel_total_params:' + str(model_total_params))
 
-    ce_loss = CrossEntropyLoss()
+    ce_device = torch.device('cuda')
+    if getattr(args, 'use_class_weight_ce', 1):
+        ce_w = build_ce_class_weights(
+            num_classes, args.ce_bg_weight, args.ce_small_organ_weight, ce_device)
+        ce_loss = CrossEntropyLoss(weight=ce_w)
+        logging.info('Phase B3 CE class weights (0-8): %s', ce_w.tolist())
+    else:
+        ce_loss = CrossEntropyLoss()
     cos_loss = CosineEmbeddingLoss()
     l1_loss = nn.L1Loss()
     dice_loss = DiceLoss(num_classes + 1)
+    dice_class_weights = build_dice_class_weights(num_classes, bool(getattr(args, 'dice_fg_only', 1)))
+    if dice_class_weights is not None:
+        logging.info('Phase B4 Dice weights (0-8): %s', dice_class_weights)
+    lambda_hi = float(getattr(args, 'lambda_hi', 0.3))
+    logging.info('Phase B2 lambda_hi (512 aux loss): %s', lambda_hi)
+    logging.info('Phase B1 preserve_small_low_res: %s', preserve_small)
     # dice_loss = Focal_loss(num_classes=num_classes + 1)
     if args.warmup:
         b_lr = base_lr / args.warmup_period
@@ -168,10 +233,10 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             assert image_batch.max() <= 3, f'image_batch max: {image_batch.max()}'
 
             image_transform = image_batch.cpu()
+            # Phase A: no pepper noise on CT; mild Gaussian only (see 汇报/HF-SAM-baseline-patches.md)
             trans = transforms.Compose([
                 transforms.ToPILImage(),
-                AddGaussianNoise(mean=random.uniform(0.5,1.5), variance=0.5, amplitude=random.uniform(0, 45),p = 0.5),
-                AddPepperNoise(0.7,0.9),
+                AddGaussianNoise(mean=random.uniform(0.5, 1.5), variance=0.5, amplitude=random.uniform(0, 15), p=0.3),
                 transforms.ToTensor(),
                 ])
             img_list = []
@@ -186,9 +251,10 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             # weight = 0.6**(0.990**epoch_num)
             # weight_self = 0.2
             # loss = (1-weight)*loss1 + (weight)*loss2
-            outputs1,attn1 = model(image_batch, multimask_output, args.img_size, gt=label_batch)
-            # loss, loss_ce, loss_dice = calc_loss(outputs, low_res_label_batch, ce_loss, dice_loss, args.dice_param)
-            loss, loss_ce, loss_dice = calc_loss(outputs1, low_res_label_batch, ce_loss, dice_loss, dice_weight=args.dice_param)
+            outputs1, attn1 = model(image_transform, multimask_output, args.img_size, gt=label_batch)
+            loss, loss_ce, loss_dice, loss_ce_hi, loss_dice_hi, loss_hi = calc_train_loss(
+                outputs1, low_res_label_batch, label_batch, ce_loss, dice_loss,
+                dice_weight=args.dice_param, lambda_hi=lambda_hi, dice_class_weights=dice_class_weights)
             
             
             optimizer.zero_grad()
@@ -211,15 +277,25 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             iter_num = iter_num + 1
             writer.add_scalar('info/lr', lr_, iter_num)
             writer.add_scalar('info/total_loss', loss, iter_num)
-            writer.add_scalar('info/loss_ce1', loss_ce, iter_num)
-            writer.add_scalar('info/loss_dice1', loss_dice, iter_num)
+            writer.add_scalar('info/loss_ce_lo', loss_ce, iter_num)
+            writer.add_scalar('info/loss_dice_lo', loss_dice, iter_num)
+            if loss_hi is not None:
+                writer.add_scalar('info/loss_hi', loss_hi, iter_num)
+                writer.add_scalar('info/loss_ce_hi', loss_ce_hi, iter_num)
+                writer.add_scalar('info/loss_dice_hi', loss_dice_hi, iter_num)
             # writer.add_scalar('info/loss_ce2', loss_ce2, iter_num)
             # writer.add_scalar('info/loss_dice2', loss_dice2, iter_num)
             # writer.add_scalar('info/loss_self2', loss_self, iter_num)
 
             # logging.info('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item()))
             # logging.info('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f, loss_ce2: %f, loss_dice2: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item(), loss_ce2.item(), loss_dice2.item()))
-            logging.info('iteration %d : loss : %f, loss_ce: %f, loss_dice: %f' % (iter_num, loss.item(), loss_ce.item(), loss_dice.item()))
+            if loss_hi is not None:
+                logging.info(
+                    'iteration %d : loss %f (lo ce %f dice %f | hi ce %f dice %f)'
+                    % (iter_num, loss.item(), loss_ce.item(), loss_dice.item(), loss_ce_hi.item(), loss_dice_hi.item()))
+            else:
+                logging.info('iteration %d : loss : %f, loss_ce: %f, loss_dice: %f'
+                             % (iter_num, loss.item(), loss_ce.item(), loss_dice.item()))
 
 
 
