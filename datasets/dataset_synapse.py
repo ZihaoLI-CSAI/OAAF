@@ -27,8 +27,8 @@ def random_rotate(image, label):
     return image, label
 
 
-def downsample_label_preserve_small(label, out_h, out_w):
-    """Block max-pool per class; rare classes (8, 4) win overlaps. Phase B1."""
+def downsample_label_preserve_small(label, out_h, out_w, overwrite_classes, fill_classes):
+    """Block max-pool. overwrite_classes replace overlaps; fill_classes only take empty cells."""
     label = np.asarray(label, np.int64)
     h, w = label.shape
     if h == out_h and w == out_w:
@@ -39,15 +39,15 @@ def downsample_label_preserve_small(label, out_h, out_w):
         return zoom(label, (out_h / h, out_w / w), order=0)
     bh, bw = h // out_h, w // out_w
     out = np.zeros((out_h, out_w), dtype=np.int64)
-    rare = (8, 4)
-    common = (1, 2, 3, 6, 7, 5)
-    for c in rare + common:
+    overwrite_set = set(int(c) for c in overwrite_classes)
+    for c in list(overwrite_classes) + list(fill_classes):
+        c = int(c)
         if not np.any(label == c):
             continue
         mask = (label == c).astype(np.float32)
         pooled = mask.reshape(out_h, bh, out_w, bw).max(axis=(1, 3))
         active = pooled > 0.5
-        if c in rare:
+        if c in overwrite_set:
             out[active] = c
         else:
             out[active & (out == 0)] = c
@@ -55,10 +55,13 @@ def downsample_label_preserve_small(label, out_h, out_w):
 
 
 class RandomGenerator(object):
-    def __init__(self, output_size, low_res, preserve_small_low_res=True):
+    def __init__(self, output_size, low_res, preserve_small_low_res=True,
+                 overwrite_classes=None, fill_classes=None):
         self.output_size = output_size
         self.low_res = low_res
         self.preserve_small_low_res = preserve_small_low_res
+        self.overwrite_classes = list(overwrite_classes or [])
+        self.fill_classes = list(fill_classes or [])
 
     def __call__(self, sample):
         image, label = sample['image'], sample['label']
@@ -73,7 +76,9 @@ class RandomGenerator(object):
             label = zoom(label, (self.output_size[0] / x, self.output_size[1] / y), order=0)
         label_h, label_w = label.shape
         if self.preserve_small_low_res:
-            low_res_label = downsample_label_preserve_small(label, self.low_res[0], self.low_res[1])
+            low_res_label = downsample_label_preserve_small(
+                label, self.low_res[0], self.low_res[1],
+                self.overwrite_classes, self.fill_classes)
         else:
             low_res_label = zoom(label, (self.low_res[0] / label_h, self.low_res[1] / label_w), order=0)
         image = torch.from_numpy(image.astype(np.float32)).unsqueeze(0)
@@ -84,8 +89,38 @@ class RandomGenerator(object):
         return sample
 
 
-def build_train_slice_sample_weights(base_dir, list_dir, split, small_classes=(4, 8), small_weight=4.0):
-    """Phase C: higher DataLoader probability for slices containing small organs."""
+def scan_foreground_pixel_counts(base_dir, list_dir, split, num_classes):
+    """Count pixels of classes 0..num_classes over the split list."""
+    names = open(os.path.join(list_dir, split + '.txt')).readlines()
+    counts = np.zeros(num_classes + 1, dtype=np.int64)
+    for name in names:
+        slice_name = name.strip('\n')
+        label = np.load(os.path.join(base_dir, slice_name + '.npz'))['label']
+        ids, freq = np.unique(label, return_counts=True)
+        for c, n in zip(ids.tolist(), freq.tolist()):
+            c = int(c)
+            if 0 <= c <= num_classes:
+                counts[c] += int(n)
+    return counts
+
+
+def select_rare_classes(counts, num_classes, topk, mode='auto', manual_ids=None):
+    """Rarest foreground classes by pixel count. overwrite order paints the rarest last."""
+    ranked = sorted(
+        [(c, int(counts[c])) for c in range(1, num_classes + 1)],
+        key=lambda item: (item[1], item[0]))
+    if mode == 'manual' and manual_ids:
+        rare = [int(c) for c in manual_ids if 1 <= int(c) <= num_classes]
+    else:
+        rare = [c for c, _ in ranked[:max(int(topk), 0)]]
+    rare_set = set(rare)
+    fill = [c for c, _ in ranked if c not in rare_set]
+    overwrite = list(reversed(rare))
+    return rare, overwrite, fill
+
+
+def build_train_slice_sample_weights(base_dir, list_dir, split, small_classes, small_weight=3.0):
+    """Higher DataLoader probability for slices that contain a rare class."""
     names = open(os.path.join(list_dir, split + '.txt')).readlines()
     weights = []
     n_small = 0

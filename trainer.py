@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import random
@@ -48,16 +49,37 @@ def torch2D_Hausdorff_distance(x,y): # Input be like (Batch,width,height)
 #     loss_dice = dice_loss(low_res_logits, low_res_label_batch, softmax=True)
 #     loss = (1 - dice_weight) * loss_ce + dice_weight * loss_dice
 #     return loss, loss_ce, loss_dice
-def build_ce_class_weights(num_classes, bg_weight, small_organ_weight, device):
-    """Phase B3: 9-way CE weights (0=background, 1-8 organs)."""
+def build_ce_class_weights(num_classes, bg_weight, rare_classes, rare_weight, device):
+    """CE weights: background down-weighted, automatically chosen rare classes up-weighted."""
     n = num_classes + 1
     w = torch.ones(n, dtype=torch.float32, device=device)
     w[0] = bg_weight
-    if n > 4:
-        w[4] = small_organ_weight
-    if n > 8:
-        w[8] = small_organ_weight
+    for c in rare_classes:
+        c = int(c)
+        if 0 < c < n:
+            w[c] = rare_weight
     return w
+
+
+def contour_band(label, radius):
+    """True on pixels within `radius` of a label boundary. label: [B,H,W]."""
+    diff = torch.zeros_like(label, dtype=torch.bool)
+    diff[:, 1:, :] |= label[:, 1:, :] != label[:, :-1, :]
+    diff[:, :-1, :] |= label[:, :-1, :] != label[:, 1:, :]
+    diff[:, :, 1:] |= label[:, :, 1:] != label[:, :, :-1]
+    diff[:, :, :-1] |= label[:, :, :-1] != label[:, :, 1:]
+    band = diff.float().unsqueeze(1)
+    k = 2 * int(radius) + 1
+    band = F.max_pool2d(band, kernel_size=k, stride=1, padding=int(radius))
+    return band.squeeze(1) > 0.5
+
+
+def boundary_ce_loss(logits, label, radius, ce_weight=None):
+    """Cross-entropy restricted to a band around the full-resolution contour."""
+    band = contour_band(label, radius)
+    per_pixel = F.cross_entropy(logits, label.long(), weight=ce_weight, reduction='none')
+    denom = band.sum().clamp_min(1).float()
+    return (per_pixel * band.float()).sum() / denom
 
 
 def build_dice_class_weights(num_classes, dice_fg_only):
@@ -77,15 +99,23 @@ def calc_loss(logits, label_batch, ce_loss, dice_loss, dice_weight: float = 0.8,
 
 
 def calc_train_loss(outputs, low_res_label_batch, full_res_label_batch, ce_loss, dice_loss,
-                    dice_weight: float, lambda_hi: float, dice_class_weights=None):
+                    dice_weight: float, lambda_hi: float, dice_class_weights=None,
+                    boundary_weight: float = 0.0, boundary_radius: int = 2, ce_weight=None):
     loss_lo, loss_ce_lo, loss_dice_lo = calc_loss(
         outputs['low_res_logits'], low_res_label_batch, ce_loss, dice_loss, dice_weight, dice_class_weights)
-    if lambda_hi <= 0:
-        return loss_lo, loss_ce_lo, loss_dice_lo, None, None, None
-    loss_hi, loss_ce_hi, loss_dice_hi = calc_loss(
-        outputs['masks'], full_res_label_batch, ce_loss, dice_loss, dice_weight, dice_class_weights)
-    loss = (1.0 - lambda_hi) * loss_lo + lambda_hi * loss_hi
-    return loss, loss_ce_lo, loss_dice_lo, loss_ce_hi, loss_dice_hi, loss_hi
+    loss_hi = loss_ce_hi = loss_dice_hi = None
+    if lambda_hi > 0:
+        loss_hi, loss_ce_hi, loss_dice_hi = calc_loss(
+            outputs['masks'], full_res_label_batch, ce_loss, dice_loss, dice_weight, dice_class_weights)
+        loss = (1.0 - lambda_hi) * loss_lo + lambda_hi * loss_hi
+    else:
+        loss = loss_lo
+    loss_boundary = None
+    if boundary_weight > 0:
+        loss_boundary = boundary_ce_loss(
+            outputs['masks'], full_res_label_batch, boundary_radius, ce_weight)
+        loss = loss + boundary_weight * loss_boundary
+    return loss, loss_ce_lo, loss_dice_lo, loss_ce_hi, loss_dice_hi, loss_hi, loss_boundary
 
 class AddGaussianNoise(object):
 
@@ -151,11 +181,32 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
     batch_size = args.batch_size * args.n_gpu
     # max_iterations = args.max_iterations
     preserve_small = bool(getattr(args, 'preserve_small_low_res', 1))
+    from datasets.dataset_synapse import scan_foreground_pixel_counts, select_rare_classes
+    pixel_counts = scan_foreground_pixel_counts(
+        args.root_path, args.list_dir, args.split, num_classes)
+    manual_ids = []
+    manual_text = str(getattr(args, 'rare_class_manual', '') or '').strip()
+    if manual_text:
+        manual_ids = [int(x) for x in manual_text.split(',') if x.strip()]
+    rare_classes, overwrite_classes, fill_classes = select_rare_classes(
+        pixel_counts, num_classes, int(getattr(args, 'rare_class_topk', 2)),
+        mode=str(getattr(args, 'rare_class_mode', 'auto')), manual_ids=manual_ids)
+    rare_stats = {
+        'pixel_counts': {str(c): int(pixel_counts[c]) for c in range(num_classes + 1)},
+        'rare_classes': [int(c) for c in rare_classes],
+        'overwrite_order': [int(c) for c in overwrite_classes],
+        'fill_order': [int(c) for c in fill_classes],
+    }
+    with open(os.path.join(snapshot_path, 'rare_class_stats.json'), 'w', encoding='utf-8') as f:
+        json.dump(rare_stats, f, indent=2)
+    logging.info('Rare classes (fewest pixels first): %s', rare_classes)
     db_train = Synapse_dataset(base_dir=args.root_path, list_dir=args.list_dir, split=args.split,
                                transform=transforms.Compose(
                                    [RandomGenerator(output_size=[args.img_size, args.img_size],
                                                       low_res=[low_res, low_res],
-                                                      preserve_small_low_res=preserve_small)
+                                                      preserve_small_low_res=preserve_small,
+                                                      overwrite_classes=overwrite_classes,
+                                                      fill_classes=fill_classes)
                                    ]))
     print("The length of train set is: {}".format(len(db_train)))
 
@@ -167,10 +218,10 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
         from datasets.dataset_synapse import build_train_slice_sample_weights
         sample_weights, ow_stats = build_train_slice_sample_weights(
             args.root_path, args.list_dir, args.split,
-            small_classes=(4, 8), small_weight=float(args.small_slice_weight))
+            small_classes=rare_classes, small_weight=float(args.small_slice_weight))
         logging.info(
-            'Phase C oversample: %d / %d train slices contain class 4 or 8; weight=%s',
-            ow_stats['small_organ_slices'], ow_stats['total'], ow_stats['small_weight'])
+            'Oversample: %d / %d train slices contain rare classes %s; weight=%s',
+            ow_stats['small_organ_slices'], ow_stats['total'], rare_classes, ow_stats['small_weight'])
         weight_tensor = torch.as_tensor(sample_weights, dtype=torch.double)
         sampler = WeightedRandomSampler(
             weight_tensor, num_samples=len(db_train), replacement=True)
@@ -192,21 +243,28 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
 
     ce_device = torch.device('cuda')
     if getattr(args, 'use_class_weight_ce', 1):
+        rare_ce = float(getattr(args, 'rare_ce_weight', args.ce_small_organ_weight))
         ce_w = build_ce_class_weights(
-            num_classes, args.ce_bg_weight, args.ce_small_organ_weight, ce_device)
+            num_classes, args.ce_bg_weight, rare_classes, rare_ce, ce_device)
         ce_loss = CrossEntropyLoss(weight=ce_w)
-        logging.info('Phase B3 CE class weights (0-8): %s', ce_w.tolist())
+        logging.info('CE class weights (0-%d): %s', num_classes, ce_w.tolist())
     else:
         ce_loss = CrossEntropyLoss()
+        ce_w = None
     cos_loss = CosineEmbeddingLoss()
     l1_loss = nn.L1Loss()
     dice_loss = DiceLoss(num_classes + 1)
     dice_class_weights = build_dice_class_weights(num_classes, bool(getattr(args, 'dice_fg_only', 1)))
     if dice_class_weights is not None:
         logging.info('Phase B4 Dice weights (0-8): %s', dice_class_weights)
-    lambda_hi = float(getattr(args, 'lambda_hi', 0.3))
-    logging.info('Phase B2 lambda_hi (512 aux loss): %s', lambda_hi)
-    logging.info('Phase B1 preserve_small_low_res: %s', preserve_small)
+    lambda_hi = float(getattr(args, 'lambda_hi', 0.45))
+    boundary_weight = float(getattr(args, 'boundary_weight', 0.15))
+    boundary_radius = int(getattr(args, 'boundary_radius', 2))
+    use_gaussian = bool(getattr(args, 'use_gaussian_noise', 0))
+    logging.info('lambda_hi (512 aux loss): %s', lambda_hi)
+    logging.info('boundary loss weight=%s radius=%s', boundary_weight, boundary_radius)
+    logging.info('gaussian noise: %s', use_gaussian)
+    logging.info('preserve_small_low_res: %s', preserve_small)
     # dice_loss = Focal_loss(num_classes=num_classes + 1)
     if args.warmup:
         b_lr = base_lr / args.warmup_period
@@ -232,19 +290,21 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             low_res_label_batch = low_res_label_batch.cuda()
             assert image_batch.max() <= 3, f'image_batch max: {image_batch.max()}'
 
-            image_transform = image_batch.cpu()
-            # Phase A: no pepper noise on CT; mild Gaussian only (see 汇报/HF-SAM-baseline-patches.md)
-            trans = transforms.Compose([
-                transforms.ToPILImage(),
-                AddGaussianNoise(mean=random.uniform(0.5, 1.5), variance=0.5, amplitude=random.uniform(0, 15), p=0.3),
-                transforms.ToTensor(),
-                ])
-            img_list = []
-            for i in range(image_transform.shape[0]):
-                img = image_transform[i]
-                img = trans(img)
-                img_list.append(img)
-            image_transform = torch.stack(img_list,dim=0).cuda()
+            if use_gaussian:
+                image_transform = image_batch.cpu()
+                trans = transforms.Compose([
+                    transforms.ToPILImage(),
+                    AddGaussianNoise(mean=random.uniform(0.5, 1.5), variance=0.5, amplitude=random.uniform(0, 15), p=0.3),
+                    transforms.ToTensor(),
+                    ])
+                img_list = []
+                for i in range(image_transform.shape[0]):
+                    img = image_transform[i]
+                    img = trans(img)
+                    img_list.append(img)
+                image_transform = torch.stack(img_list, dim=0).cuda()
+            else:
+                image_transform = image_batch
             # outputs1,outputs2, attn1, attn2 = model(image_batch, multimask_output, args.img_size, gt=low_res_label_batch)
             # loss1, loss_ce1, loss_dice1 = calc_loss(outputs1, low_res_label_batch, ce_loss, dice_loss, dice_weight=args.dice_param)
             # loss2, loss_ce2, loss_dice2 = calc_loss(outputs2, label_batch, ce_loss, dice_loss, dice_weight=args.dice_param)
@@ -252,9 +312,10 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             # weight_self = 0.2
             # loss = (1-weight)*loss1 + (weight)*loss2
             outputs1, attn1 = model(image_transform, multimask_output, args.img_size, gt=label_batch)
-            loss, loss_ce, loss_dice, loss_ce_hi, loss_dice_hi, loss_hi = calc_train_loss(
+            loss, loss_ce, loss_dice, loss_ce_hi, loss_dice_hi, loss_hi, loss_boundary = calc_train_loss(
                 outputs1, low_res_label_batch, label_batch, ce_loss, dice_loss,
-                dice_weight=args.dice_param, lambda_hi=lambda_hi, dice_class_weights=dice_class_weights)
+                dice_weight=args.dice_param, lambda_hi=lambda_hi, dice_class_weights=dice_class_weights,
+                boundary_weight=boundary_weight, boundary_radius=boundary_radius, ce_weight=ce_w)
             
             
             optimizer.zero_grad()
@@ -283,19 +344,23 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                 writer.add_scalar('info/loss_hi', loss_hi, iter_num)
                 writer.add_scalar('info/loss_ce_hi', loss_ce_hi, iter_num)
                 writer.add_scalar('info/loss_dice_hi', loss_dice_hi, iter_num)
+            if loss_boundary is not None:
+                writer.add_scalar('info/loss_boundary', loss_boundary, iter_num)
             # writer.add_scalar('info/loss_ce2', loss_ce2, iter_num)
             # writer.add_scalar('info/loss_dice2', loss_dice2, iter_num)
             # writer.add_scalar('info/loss_self2', loss_self, iter_num)
 
             # logging.info('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item()))
             # logging.info('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f, loss_ce2: %f, loss_dice2: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item(), loss_ce2.item(), loss_dice2.item()))
+            boundary_val = loss_boundary.item() if loss_boundary is not None else 0.0
             if loss_hi is not None:
                 logging.info(
-                    'iteration %d : loss %f (lo ce %f dice %f | hi ce %f dice %f)'
-                    % (iter_num, loss.item(), loss_ce.item(), loss_dice.item(), loss_ce_hi.item(), loss_dice_hi.item()))
+                    'iteration %d : loss %f (lo ce %f dice %f | hi ce %f dice %f | boundary %f)'
+                    % (iter_num, loss.item(), loss_ce.item(), loss_dice.item(),
+                       loss_ce_hi.item(), loss_dice_hi.item(), boundary_val))
             else:
-                logging.info('iteration %d : loss : %f, loss_ce: %f, loss_dice: %f'
-                             % (iter_num, loss.item(), loss_ce.item(), loss_dice.item()))
+                logging.info('iteration %d : loss : %f, loss_ce: %f, loss_dice: %f, boundary: %f'
+                             % (iter_num, loss.item(), loss_ce.item(), loss_dice.item(), boundary_val))
 
 
 
