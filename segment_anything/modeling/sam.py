@@ -78,25 +78,28 @@ class Sam(nn.Module):
         output_tensor = torch.cat(tensor_list, dim=1)
         return output_tensor.float()
 
-    def forward(self, batched_input, multimask_output, image_size, gt=None, mode='train'):
+    def forward(self, batched_input, multimask_output, image_size, gt=None, mode='train', input_points=None, boxes=None):
         # if isinstance(batched_input, list):
         #     outputs = self.forward_test(batched_input, multimask_output)
             
         # else:
         #     outputs = self.forward_train(batched_input, multimask_output, image_size
-        outputs = self.forward_train(batched_input, multimask_output, image_size, gt=gt, mode=mode)
+        outputs = self.forward_train(
+            batched_input, multimask_output, image_size,
+            input_points=input_points, boxes=boxes, gt=gt, mode=mode)
             
         return outputs
 
-    def forward_train(self, batched_input, multimask_output, image_size,input_points=None, gt=None, mode='train'):
+    def forward_train(self, batched_input, multimask_output, image_size, input_points=None, boxes=None, gt=None, mode='train'):
         input_images = self.preprocess(batched_input)  #input_images,batched_input:torch.Size([8, 3, 512, 512])
         # image_embeddings,low_image_embeddings = self.image_encoder(input_images)
         image_embeddings,interm_embeddings = self.image_encoder(input_images)   #image_embeddings:torch.Size([8, 256, 32, 32])
+        self._prompt_cache = (image_embeddings, interm_embeddings)
         interm_embeddings1 = interm_embeddings[0] # early layer  torch.Size([8, 32, 32, 768])
         interm_embeddings2 = interm_embeddings[0] 
         interm_embeddings3 = interm_embeddings[0] 
         sparse_embeddings, dense_embeddings = self.prompt_encoder(  #sparse_embeddings:torch.Size([1, 0, 256])   dense_embeddings:torch.Size([1, 256, 32, 32])
-            points=input_points, boxes=None, masks=None
+            points=input_points, boxes=boxes, masks=None
         )
         low_res_masks, iou_predictions, attn1 = self.mask_decoder(
             image_embeddings=image_embeddings,  #torch.Size([8, 256, 32, 32])
@@ -152,6 +155,37 @@ class Sam(nn.Module):
 
         # return outputs1, outputs2, attn1, attn1
         return outputs1, attn1
+
+    def forward_prompt_from_cache(self, indices, input_points, boxes, multimask_output, image_size, mode='train'):
+        """Run the decoder again on cached image features, with a point and a box."""
+        image_embeddings, interm_embeddings = self._prompt_cache
+        image_embeddings = image_embeddings[indices]
+        interm = interm_embeddings[0][indices]
+        sparse_embeddings, dense_embeddings = self.prompt_encoder(
+            points=input_points, boxes=boxes, masks=None)
+        low_res_masks, iou_predictions, attn1 = self.mask_decoder(
+            image_embeddings=image_embeddings,
+            image_pe=self.prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=multimask_output,
+            interm_embeddings1=interm.unsqueeze(0),
+            interm_embeddings2=interm.unsqueeze(0),
+            interm_embeddings3=interm.unsqueeze(0),
+            gt=None,
+            mode=mode,
+        )
+        masks = self.postprocess_masks(
+            low_res_masks,
+            input_size=(image_size, image_size),
+            original_size=(image_size, image_size),
+        )
+        outputs = {
+            'masks': masks,
+            'iou_predictions': iou_predictions,
+            'low_res_logits': low_res_masks,
+        }
+        return outputs, attn1
 
     @torch.no_grad()
     def forward_test(

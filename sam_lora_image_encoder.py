@@ -202,8 +202,14 @@ class LoRA_Sam(nn.Module):
         for w_B in self.w_Bs:
             nn.init.zeros_(w_B.weight)
 
-    def forward(self, batched_input, multimask_output, image_size, gt=None, mode='train'):
-        return self.sam(batched_input, multimask_output, image_size, gt=gt, mode=mode)
+    def forward(self, batched_input, multimask_output, image_size, gt=None, mode='train', input_points=None, boxes=None):
+        return self.sam(
+            batched_input, multimask_output, image_size,
+            gt=gt, mode=mode, input_points=input_points, boxes=boxes)
+
+    def forward_prompt_from_cache(self, indices, input_points, boxes, multimask_output, image_size, mode='train'):
+        return self.sam.forward_prompt_from_cache(
+            indices, input_points, boxes, multimask_output, image_size, mode=mode)
 
 
 

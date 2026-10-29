@@ -87,6 +87,18 @@ parser.add_argument('--oversample_small_organs', type=int, default=1,
                     help='1: WeightedRandomSampler boosts slices that contain a rare class')
 parser.add_argument('--small_slice_weight', type=float, default=3.0,
                     help='Sampling weight for slices that contain a rare class')
+parser.add_argument('--use_liver_prompt', type=int, default=0,
+                    help='1: second forward uses a liver point and box, and only the gallbladder channel is replaced')
+parser.add_argument('--prompt_liver_class', type=int, default=5)
+parser.add_argument('--prompt_target_class', type=int, default=4)
+parser.add_argument('--prompt_point_down', type=int, default=8,
+                    help='Pixels to move the prompt point below the lowest liver row')
+parser.add_argument('--prompt_box_size', type=int, default=96)
+parser.add_argument('--prompt_jitter', type=int, default=10)
+parser.add_argument('--prompt_box_scale_min', type=float, default=0.8)
+parser.add_argument('--prompt_box_scale_max', type=float, default=1.2)
+parser.add_argument('--prompt_drop_prob', type=float, default=0.2,
+                    help='Fraction of training iterations that skip the prompt')
 args = parser.parse_args()
 
 if __name__ == "__main__":

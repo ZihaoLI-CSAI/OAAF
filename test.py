@@ -21,6 +21,15 @@ class_to_name = {1: 'spleen', 2: 'right kidney', 3: 'left kidney', 4: 'gallbladd
 
 
 def inference(args, multimask_output, db_config, model, test_save_path=None):
+    liver_prompt = None
+    if int(getattr(args, 'use_liver_prompt', 0)):
+        liver_prompt = {
+            'liver_class': int(args.prompt_liver_class),
+            'target_class': int(args.prompt_target_class),
+            'point_down': int(args.prompt_point_down),
+            'box_size': int(args.prompt_box_size),
+        }
+        logging.info('Liver prompt enabled: %s', liver_prompt)
     db_test = db_config['Dataset'](base_dir=args.volume_path, list_dir=args.list_dir, split='test_vol')
     testloader = DataLoader(db_test, batch_size=1, shuffle=False, num_workers=1)
     logging.info(f'{len(testloader)} test iterations per epoch')
@@ -31,7 +40,8 @@ def inference(args, multimask_output, db_config, model, test_save_path=None):
         image, label, case_name = sampled_batch['image'], sampled_batch['label'], sampled_batch['case_name'][0]
         metric_i = test_single_volume(image, label, model, classes=args.num_classes, multimask_output=multimask_output,
                                       patch_size=[args.img_size, args.img_size], input_size=[args.input_size, args.input_size],
-                                      test_save_path=test_save_path, case=case_name, z_spacing=db_config['z_spacing'], mode='test',stage=args.stage)
+                                      test_save_path=test_save_path, case=case_name, z_spacing=db_config['z_spacing'], mode='test',stage=args.stage,
+                                      liver_prompt=liver_prompt)
         metric_list += np.array(metric_i)
         logging.info('idx %d case %s mean_dice %f mean_hd95 %f mean_jaccard %f mean_asd %f mean_recall %f mean_specificity %f mean_precision %f' % (
             i_batch, case_name, np.mean(metric_i, axis=0)[0], np.mean(metric_i, axis=0)[1],np.mean(metric_i, axis=0)[2],np.mean(metric_i, axis=0)[3], np.mean(metric_i, axis=0)[4],np.mean(metric_i, axis=0)[5],np.mean(metric_i, axis=0)[6]))
@@ -113,6 +123,12 @@ if __name__ == '__main__':
     parser.add_argument('--module', type=str, default='sam_lora_image_encoder')
     parser.add_argument('--stage', type=int, default=3)
     parser.add_argument('--mode',  type=str, default='test')
+    parser.add_argument('--use_liver_prompt', type=int, default=0,
+                        help='1: prompt gallbladder from the predicted liver')
+    parser.add_argument('--prompt_liver_class', type=int, default=5)
+    parser.add_argument('--prompt_target_class', type=int, default=4)
+    parser.add_argument('--prompt_point_down', type=int, default=8)
+    parser.add_argument('--prompt_box_size', type=int, default=96)
 
     args = parser.parse_args()
 

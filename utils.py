@@ -121,8 +121,58 @@ def calculate_metric_percase(pred, gt):
         return 0, 0,0,0,0,0,0
 
 
+def liver_gallbladder_prompts(liver_mask, point_down=8, box_size=96, jitter=0, scale_min=1.0, scale_max=1.0):
+    """Point and box for the gallbladder from a liver mask.
+
+    liver_mask: [B,H,W] bool. The point is the center of the lowest liver row,
+    shifted down by point_down pixels. The box is centered on that point.
+    Returns coords [B,1,2] (x, y), labels [B,1], boxes [B,4] (x0,y0,x1,y1), valid [B].
+    """
+    batch, height, width = liver_mask.shape
+    device = liver_mask.device
+    coords = torch.zeros((batch, 1, 2), device=device, dtype=torch.float32)
+    labels = torch.ones((batch, 1), device=device, dtype=torch.int64)
+    boxes = torch.zeros((batch, 4), device=device, dtype=torch.float32)
+    valid = torch.zeros(batch, device=device, dtype=torch.bool)
+    for b in range(batch):
+        rows, cols = torch.where(liver_mask[b])
+        if rows.numel() == 0:
+            continue
+        bottom = rows.max()
+        on_bottom = cols[rows == bottom].float()
+        cx = on_bottom.mean()
+        cy = bottom.float() + float(point_down)
+        if jitter:
+            cx = cx + torch.empty(1, device=device).uniform_(-jitter, jitter).squeeze(0)
+            cy = cy + torch.empty(1, device=device).uniform_(-jitter, jitter).squeeze(0)
+        scale = scale_min
+        if scale_max != scale_min:
+            scale = float(torch.empty(1).uniform_(scale_min, scale_max))
+        side = float(box_size) * scale
+        x0 = cx - side / 2.0
+        y0 = cy - side / 2.0
+        x1 = cx + side / 2.0
+        y1 = cy + side / 2.0
+        cx = cx.clamp(0, width - 1)
+        cy = cy.clamp(0, height - 1)
+        x0 = x0.clamp(0, width - 1)
+        y0 = y0.clamp(0, height - 1)
+        x1 = x1.clamp(0, width - 1)
+        y1 = y1.clamp(0, height - 1)
+        if float(x1 - x0) < 1.0 or float(y1 - y0) < 1.0:
+            continue
+        coords[b, 0, 0] = cx
+        coords[b, 0, 1] = cy
+        boxes[b, 0] = x0
+        boxes[b, 1] = y0
+        boxes[b, 2] = x1
+        boxes[b, 3] = y1
+        valid[b] = True
+    return coords, labels, boxes, valid
+
+
 def test_single_volume(image, label, net, classes, multimask_output, patch_size=[256, 256], input_size=[224, 224],
-                       test_save_path=None, case=None, z_spacing=1, stage=2, mode='test'):
+                       test_save_path=None, case=None, z_spacing=1, stage=2, mode='test', liver_prompt=None):
     lab = label.squeeze(0)
     image, label = image.squeeze(0).cpu().detach().numpy(), label.squeeze(0).cpu().detach().numpy()
     if len(image.shape) == 3:
@@ -147,6 +197,19 @@ def test_single_volume(image, label, net, classes, multimask_output, patch_size=
                 # elif stage == 2:
                 #     output_masks = outputs2['masks']
                 output_masks = outputs1['masks']
+                if liver_prompt is not None:
+                    liver = torch.argmax(output_masks, dim=1) == int(liver_prompt['liver_class'])
+                    coords, point_labels, boxes, valid = liver_gallbladder_prompts(
+                        liver,
+                        point_down=int(liver_prompt['point_down']),
+                        box_size=int(liver_prompt['box_size']))
+                    if bool(valid[0]):
+                        outputs2, _ = net(
+                            inputs, multimask_output, patch_size[0], gt=None, mode='test',
+                            input_points=(coords, point_labels), boxes=boxes)
+                        target = int(liver_prompt['target_class'])
+                        output_masks = output_masks.clone()
+                        output_masks[:, target] = outputs2['masks'][:, target]
 
                 out = torch.argmax(torch.softmax(output_masks, dim=1), dim=1).squeeze(0)
                 out = out.cpu().detach().numpy()

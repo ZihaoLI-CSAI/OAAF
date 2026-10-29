@@ -15,7 +15,7 @@ from torch.nn.modules.loss import CrossEntropyLoss, CosineEmbeddingLoss
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.nn.functional as F
 from tqdm import tqdm
-from utils import DiceLoss, Focal_loss
+from utils import DiceLoss, Focal_loss, liver_gallbladder_prompts
 from torchvision import transforms
 from icecream import ic
 from PIL import Image
@@ -265,6 +265,16 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
     logging.info('boundary loss weight=%s radius=%s', boundary_weight, boundary_radius)
     logging.info('gaussian noise: %s', use_gaussian)
     logging.info('preserve_small_low_res: %s', preserve_small)
+    use_liver_prompt = bool(getattr(args, 'use_liver_prompt', 0))
+    if use_liver_prompt and args.n_gpu > 1:
+        raise RuntimeError('Liver prompt is implemented for n_gpu=1')
+    if use_liver_prompt:
+        logging.info(
+            'Liver prompt: liver class %s -> target class %s, point_down=%s, box=%s, jitter=%s, '
+            'box scale %s-%s, drop prob %s',
+            args.prompt_liver_class, args.prompt_target_class, args.prompt_point_down,
+            args.prompt_box_size, args.prompt_jitter, args.prompt_box_scale_min,
+            args.prompt_box_scale_max, args.prompt_drop_prob)
     # dice_loss = Focal_loss(num_classes=num_classes + 1)
     if args.warmup:
         b_lr = base_lr / args.warmup_period
@@ -312,6 +322,33 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             # weight_self = 0.2
             # loss = (1-weight)*loss1 + (weight)*loss2
             outputs1, attn1 = model(image_transform, multimask_output, args.img_size, gt=label_batch)
+            prompted = 0
+            if use_liver_prompt and random.random() >= float(args.prompt_drop_prob):
+                liver = label_batch == int(args.prompt_liver_class)
+                coords, point_labels, boxes, valid = liver_gallbladder_prompts(
+                    liver,
+                    point_down=int(args.prompt_point_down),
+                    box_size=int(args.prompt_box_size),
+                    jitter=int(args.prompt_jitter),
+                    scale_min=float(args.prompt_box_scale_min),
+                    scale_max=float(args.prompt_box_scale_max))
+                idx = valid.nonzero(as_tuple=False).view(-1)
+                if idx.numel() > 0:
+                    prompt_model = model.module if hasattr(model, 'module') else model
+                    outputs2, _ = prompt_model.forward_prompt_from_cache(
+                        idx, (coords[idx], point_labels[idx]), boxes[idx],
+                        multimask_output, args.img_size, mode='train')
+                    target = int(args.prompt_target_class)
+                    masks = outputs1['masks'].clone()
+                    low_res = outputs1['low_res_logits'].clone()
+                    masks[idx, target] = outputs2['masks'][:, target]
+                    low_res[idx, target] = outputs2['low_res_logits'][:, target]
+                    outputs1 = {
+                        'masks': masks,
+                        'iou_predictions': outputs1['iou_predictions'],
+                        'low_res_logits': low_res,
+                    }
+                    prompted = int(idx.numel())
             loss, loss_ce, loss_dice, loss_ce_hi, loss_dice_hi, loss_hi, loss_boundary = calc_train_loss(
                 outputs1, low_res_label_batch, label_batch, ce_loss, dice_loss,
                 dice_weight=args.dice_param, lambda_hi=lambda_hi, dice_class_weights=dice_class_weights,
@@ -353,14 +390,17 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             # logging.info('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item()))
             # logging.info('iteration %d : loss : %f, loss_ce1: %f, loss_dice1: %f, loss_ce2: %f, loss_dice2: %f' % (iter_num, loss.item(), loss_ce1.item(), loss_dice1.item(), loss_ce2.item(), loss_dice2.item()))
             boundary_val = loss_boundary.item() if loss_boundary is not None else 0.0
+            prompt_msg = ''
+            if use_liver_prompt:
+                prompt_msg = ' | prompted %d/%d' % (prompted, int(image_batch.shape[0]))
             if loss_hi is not None:
                 logging.info(
-                    'iteration %d : loss %f (lo ce %f dice %f | hi ce %f dice %f | boundary %f)'
+                    'iteration %d : loss %f (lo ce %f dice %f | hi ce %f dice %f | boundary %f)%s'
                     % (iter_num, loss.item(), loss_ce.item(), loss_dice.item(),
-                       loss_ce_hi.item(), loss_dice_hi.item(), boundary_val))
+                       loss_ce_hi.item(), loss_dice_hi.item(), boundary_val, prompt_msg))
             else:
-                logging.info('iteration %d : loss : %f, loss_ce: %f, loss_dice: %f, boundary: %f'
-                             % (iter_num, loss.item(), loss_ce.item(), loss_dice.item(), boundary_val))
+                logging.info('iteration %d : loss : %f, loss_ce: %f, loss_dice: %f, boundary: %f%s'
+                             % (iter_num, loss.item(), loss_ce.item(), loss_dice.item(), boundary_val, prompt_msg))
 
 
 
