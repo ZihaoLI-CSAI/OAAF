@@ -144,7 +144,7 @@ class MaskDecoder_512(nn.Module):
         hq_features2 = self.compress_vit_feat(vit_features2)
         vit_features3 = interm_embeddings3[0].permute(0, 3, 1, 2) # early-layer ViT feature, after 1st global attention block in ViT
         hq_features3 = self.compress_vit_feat(vit_features3)
-        masks, iou_pred, attn_out = self.predict_masks(
+        pred = self.predict_masks(
             image_embeddings=image_embeddings,
             image_pe=image_pe,
             sparse_prompt_embeddings=sparse_prompt_embeddings,
@@ -157,10 +157,10 @@ class MaskDecoder_512(nn.Module):
             img_size=img_size,
             return_stage1_feats=return_stage1_feats,
         )
-
         if return_stage1_feats:
-            masks, iou_pred, attn_out, msk_feat, up_embed = masks
+            masks, iou_pred, attn_out, msk_feat, up_embed = pred
             return masks, iou_pred, attn_out, msk_feat, up_embed
+        masks, iou_pred, attn_out = pred
         return masks, iou_pred, attn_out
 
     def predict_masks(
