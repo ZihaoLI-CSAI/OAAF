@@ -186,7 +186,8 @@ def _build_sam(
                 iou_head_hidden_dim=256,
             ),
             pixel_mean=pixel_mean,
-            pixel_std=pixel_std
+            pixel_std=pixel_std,
+            two_stage=False,
         )
     # sam.eval()
     sam.train()
