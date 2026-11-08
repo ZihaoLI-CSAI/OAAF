@@ -111,7 +111,9 @@ if __name__ == '__main__':
     parser.add_argument('--vit_name', type=str, default='vit_b', help='Select one vit model')
     parser.add_argument('--rank', type=int, default=5, help='Rank for LoRA adaptation (must match training)')
     parser.add_argument('--module', type=str, default='sam_lora_image_encoder')
-    parser.add_argument('--stage', type=int, default=3)
+    parser.add_argument('--stage', type=int, default=2,
+                        help='2: use stage-2 masks when two_stage; 1: stage-1 only')
+    parser.add_argument('--two_stage', type=int, default=1)
     parser.add_argument('--mode',  type=str, default='test')
 
     args = parser.parse_args()
@@ -119,7 +121,7 @@ if __name__ == '__main__':
     if args.config is not None:
         config_dict = config_to_dict(args.config)
         _config_int_keys = {
-            'num_classes', 'img_size', 'input_size', 'seed', 'deterministic', 'rank', 'stage',
+            'num_classes', 'img_size', 'input_size', 'seed', 'deterministic', 'rank', 'stage', 'two_stage',
         }
         for key in config_dict:
             if not hasattr(args, key):
@@ -161,6 +163,9 @@ if __name__ == '__main__':
                                                                     checkpoint=args.ckpt, pixel_mean=[0, 0, 0],
                                                                     pixel_std=[1, 1, 1])
     
+    if hasattr(sam, 'two_stage'):
+        sam.two_stage = bool(args.two_stage)
+
     pkg = import_module(args.module)
     net = pkg.LoRA_Sam(sam, args.rank).cuda()
 

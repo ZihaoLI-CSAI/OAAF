@@ -73,6 +73,10 @@ parser.add_argument('--oversample_small_organs', type=int, default=1,
                     help='1: WeightedRandomSampler boosts slices with class 4 or 8')
 parser.add_argument('--small_slice_weight', type=float, default=4.0,
                     help='Sampling weight for slices containing gallbladder or pancreas')
+parser.add_argument('--two_stage', type=int, default=1,
+                    help='1: H-SAM phase-1 MVP (stage1 prior + lightweight stage2)')
+parser.add_argument('--lambda_stage1', type=float, default=0.25,
+                    help='Weight for stage-1 deep supervision when two_stage=1')
 args = parser.parse_args()
 
 if __name__ == "__main__":
@@ -115,6 +119,9 @@ if __name__ == "__main__":
                                                                 num_classes=args.num_classes,
                                                                 checkpoint=args.ckpt, pixel_mean=[0, 0, 0],
                                                                 pixel_std=[1, 1, 1])
+
+    if hasattr(sam, 'two_stage'):
+        sam.two_stage = bool(args.two_stage)
 
     pkg = import_module(args.module)
     net = pkg.LoRA_Sam(sam, args.rank).cuda()

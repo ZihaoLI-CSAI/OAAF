@@ -205,7 +205,9 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
     if dice_class_weights is not None:
         logging.info('Phase B4 Dice weights (0-8): %s', dice_class_weights)
     lambda_hi = float(getattr(args, 'lambda_hi', 0.3))
+    lambda_stage1 = float(getattr(args, 'lambda_stage1', 0.25))
     logging.info('Phase B2 lambda_hi (512 aux loss): %s', lambda_hi)
+    logging.info('Two-stage MVP lambda_stage1 (deep sup on stage1): %s', lambda_stage1)
     logging.info('Phase B1 preserve_small_low_res: %s', preserve_small)
     # dice_loss = Focal_loss(num_classes=num_classes + 1)
     if args.warmup:
@@ -251,10 +253,34 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             # weight = 0.6**(0.990**epoch_num)
             # weight_self = 0.2
             # loss = (1-weight)*loss1 + (weight)*loss2
-            outputs1, attn1 = model(image_transform, multimask_output, args.img_size, gt=label_batch)
-            loss, loss_ce, loss_dice, loss_ce_hi, loss_dice_hi, loss_hi = calc_train_loss(
-                outputs1, low_res_label_batch, label_batch, ce_loss, dice_loss,
-                dice_weight=args.dice_param, lambda_hi=lambda_hi, dice_class_weights=dice_class_weights)
+            outputs, attn1 = model(image_transform, multimask_output, args.img_size, gt=label_batch)
+            lambda_s1 = float(getattr(args, 'lambda_stage1', 0.25))
+            two_stage = getattr(outputs, 'get', None) and outputs.get('stage1') is not None
+            if two_stage:
+                outputs_s1 = outputs['stage1']
+                outputs_s2 = outputs
+                if outputs_s2['low_res_logits'].shape[-2:] != low_res_label_batch.shape[-2:]:
+                    lo2 = F.interpolate(
+                        outputs_s2['low_res_logits'],
+                        size=low_res_label_batch.shape[-2:],
+                        mode='bilinear',
+                        align_corners=False,
+                    )
+                    outputs_s2 = {**outputs_s2, 'low_res_logits': lo2}
+                loss2, loss_ce, loss_dice, loss_ce_hi, loss_dice_hi, loss_hi = calc_train_loss(
+                    outputs_s2, low_res_label_batch, label_batch, ce_loss, dice_loss,
+                    dice_weight=args.dice_param, lambda_hi=lambda_hi, dice_class_weights=dice_class_weights)
+                if lambda_s1 > 0:
+                    loss_s1, _, _, _, _, _ = calc_train_loss(
+                        outputs_s1, low_res_label_batch, label_batch, ce_loss, dice_loss,
+                        dice_weight=args.dice_param, lambda_hi=0.0, dice_class_weights=dice_class_weights)
+                    loss = (1.0 - lambda_s1) * loss2 + lambda_s1 * loss_s1
+                else:
+                    loss = loss2
+            else:
+                loss, loss_ce, loss_dice, loss_ce_hi, loss_dice_hi, loss_hi = calc_train_loss(
+                    outputs, low_res_label_batch, label_batch, ce_loss, dice_loss,
+                    dice_weight=args.dice_param, lambda_hi=lambda_hi, dice_class_weights=dice_class_weights)
             
             
             optimizer.zero_grad()

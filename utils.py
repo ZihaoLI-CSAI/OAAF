@@ -141,12 +141,13 @@ def test_single_volume(image, label, net, classes, multimask_output, patch_size=
             net.eval()
             with torch.no_grad():
                 # outputs1,outputs2,_,_ = net(inputs, multimask_output, patch_size[0], gt=None, mode='test')
-                outputs1,_= net(inputs, multimask_output, patch_size[0], gt=None, mode='test')
-                # if stage == 3:
-                #     output_masks = (outputs1['masks'] + outputs2['masks'])/2
-                # elif stage == 2:
-                #     output_masks = outputs2['masks']
-                output_masks = outputs1['masks']
+                outputs, _ = net(inputs, multimask_output, patch_size[0], gt=None, mode='test')
+                if stage >= 2 and isinstance(outputs, dict) and 'stage1' in outputs:
+                    output_masks = outputs['masks']
+                elif stage == 1 and isinstance(outputs, dict) and 'stage1' in outputs:
+                    output_masks = outputs['stage1']['masks']
+                else:
+                    output_masks = outputs['masks']
 
                 out = torch.argmax(torch.softmax(output_masks, dim=1), dim=1).squeeze(0)
                 out = out.cpu().detach().numpy()

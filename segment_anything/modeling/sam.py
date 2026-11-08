@@ -39,7 +39,8 @@ class Sam(nn.Module):
         mask_decoder: MaskDecoder_224,
         mask_decoder2: MaskDecoder2_224,
         pixel_mean: List[float] = [123.675, 116.28, 103.53],
-        pixel_std: List[float] = [58.395, 57.12, 57.375]
+        pixel_std: List[float] = [58.395, 57.12, 57.375],
+        two_stage: bool = True,
     ) -> None:
         """
         SAM predicts object masks from an image and input prompts.
@@ -59,6 +60,7 @@ class Sam(nn.Module):
         self.mask_decoder = mask_decoder
         self.prompt_encoder2 = prompt_encoder
         self.mask_decoder2 = mask_decoder2
+        self.two_stage = two_stage
         self.num_classes = 9
         self.reduce_factor = 4    
         self.register_buffer("pixel_mean", torch.Tensor(pixel_mean).view(-1, 1, 1), False)
@@ -98,60 +100,77 @@ class Sam(nn.Module):
         sparse_embeddings, dense_embeddings = self.prompt_encoder(  #sparse_embeddings:torch.Size([1, 0, 256])   dense_embeddings:torch.Size([1, 256, 32, 32])
             points=input_points, boxes=None, masks=None
         )
-        low_res_masks, iou_predictions, attn1 = self.mask_decoder(
-            image_embeddings=image_embeddings,  #torch.Size([8, 256, 32, 32])
+        stage1_decoder = self.mask_decoder
+        if self.two_stage:
+            s1_out = stage1_decoder(
+                image_embeddings=image_embeddings,
+                image_pe=self.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+                interm_embeddings1=interm_embeddings1.unsqueeze(0),
+                interm_embeddings2=interm_embeddings2.unsqueeze(0),
+                interm_embeddings3=interm_embeddings3.unsqueeze(0),
+                gt=gt,
+                mode=mode,
+                return_stage1_feats=True,
+            )
+            low_res_masks, iou_predictions, attn1, msk_feat, up_embed = s1_out
+        else:
+            low_res_masks, iou_predictions, attn1 = stage1_decoder(
+                image_embeddings=image_embeddings,
+                image_pe=self.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+                interm_embeddings1=interm_embeddings1.unsqueeze(0),
+                interm_embeddings2=interm_embeddings2.unsqueeze(0),
+                interm_embeddings3=interm_embeddings3.unsqueeze(0),
+                gt=gt,
+                mode=mode,
+            )
+            msk_feat, up_embed = None, None
+
+        masks_s1 = self.postprocess_masks(
+            low_res_masks,
+            input_size=(image_size, image_size),
+            original_size=(image_size, image_size),
+        )
+        outputs1 = {
+            'masks': masks_s1,
+            'iou_predictions': iou_predictions,
+            'low_res_logits': low_res_masks,
+        }
+
+        if not self.two_stage:
+            return outputs1, attn1
+
+        # Stage-1 prior at 128×128 (H/4), not extra /4 downsample
+        prior_mask = low_res_masks.detach() if mode == 'train' else low_res_masks
+        low_res_masks2, iou_predictions2, attn2 = self.mask_decoder2(
+            image_embeddings=image_embeddings,
             image_pe=self.prompt_encoder.get_dense_pe(),
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
             multimask_output=multimask_output,
-            interm_embeddings1=interm_embeddings1.unsqueeze(0),  #torch.Size([1, 8, 32, 32, 768])
-            interm_embeddings2=interm_embeddings2.unsqueeze(0),  #torch.Size([1, 8, 32, 32, 768])
-            interm_embeddings3=interm_embeddings3.unsqueeze(0),  #torch.Size([1, 8, 32, 32, 768])
+            mask_feat=prior_mask,
             gt=gt,
-            mode=mode
+            mode=mode,
+            msk_feat=msk_feat,
+            up_embed=up_embed,
         )
-        masks = self.postprocess_masks(
-            low_res_masks,
+        masks2 = self.postprocess_masks(
+            low_res_masks2,
             input_size=(image_size, image_size),
-            original_size=(image_size, image_size)
+            original_size=(image_size, image_size),
         )
-        outputs1 = {
-            'masks': masks,
-            'iou_predictions': iou_predictions,
-            'low_res_logits': low_res_masks
+        outputs2 = {
+            'masks': masks2,
+            'iou_predictions': iou_predictions2,
+            'low_res_logits': low_res_masks2,
+            'stage1': outputs1,
         }
-        
-        # ps_mask = F.interpolate(low_res_masks,size=(int(low_res_masks.shape[-2]/4), int(low_res_masks.shape[-1]/4)),mode='bilinear')
-
-        # if mode == 'train':
-        #   img_noise_gaussian = torch.randn((image_embeddings.size())).cuda() * 0.2 *(image_embeddings.max()-image_embeddings.min())
-        #   image_embeddings = (image_embeddings + img_noise_gaussian.cuda())
-        
-        # low_res_masks2, iou_predictions2, attn1 = self.mask_decoder2(
-        #     image_embeddings=image_embeddings,
-        #     image_pe=self.prompt_encoder.get_dense_pe(),
-        #     sparse_prompt_embeddings=sparse_embeddings,
-        #     dense_prompt_embeddings=dense_embeddings,
-        #     multimask_output=multimask_output,
-        #     mask_feat = ps_mask,
-        #     gt=gt,
-        #     mode=mode,
-        #     msk_feat=msk_feat,
-        #     up_embed=up_embed
-        # )
-        # masks2 = self.postprocess_masks(
-        #     low_res_masks2,
-        #     input_size=(image_size, image_size),
-        #     original_size=(image_size, image_size)
-        # )
-        # outputs2 = {
-        #     'masks': masks2,
-        #     'iou_predictions': iou_predictions2,
-        #     'low_res_logits': low_res_masks2
-        # }
-
-        # return outputs1, outputs2, attn1, attn1
-        return outputs1, attn1
+        return outputs2, attn2
 
     @torch.no_grad()
     def forward_test(

@@ -190,9 +190,11 @@ class LoRA_Sam(nn.Module):
 
         # load mask decoder
         mask_decoder2_keys = [k for k in sam_keys if 'mask_decoder2' in k]
-        mask_decoder2_values = [state_dict[k] for k in mask_decoder2_keys]
-        mask_decoder2_new_state_dict = {k: v for k, v in zip(mask_decoder2_keys, mask_decoder2_values)}
-        sam_dict.update(mask_decoder2_new_state_dict)
+        mask_decoder2_keys = [k for k in mask_decoder2_keys if k in state_dict]
+        if mask_decoder2_keys:
+            mask_decoder2_values = [state_dict[k] for k in mask_decoder2_keys]
+            mask_decoder2_new_state_dict = {k: v for k, v in zip(mask_decoder2_keys, mask_decoder2_values)}
+            sam_dict.update(mask_decoder2_new_state_dict)
 
         self.sam.load_state_dict(sam_dict)
 

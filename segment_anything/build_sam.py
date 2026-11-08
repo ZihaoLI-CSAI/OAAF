@@ -123,7 +123,6 @@ def _build_sam(
                 iou_head_hidden_dim=256,
             ),
             mask_decoder2=MaskDecoder2_512(
-                # num_multimask_outputs=3,
                 num_multimask_outputs=num_classes,
                 transformer2=TwoWayTransformer2(
                     depth=2,
@@ -134,9 +133,11 @@ def _build_sam(
                 transformer_dim=prompt_embed_dim,
                 iou_head_depth=3,
                 iou_head_hidden_dim=256,
+                mvp_mode=True,
             ),
             pixel_mean=pixel_mean,
-            pixel_std=pixel_std
+            pixel_std=pixel_std,
+            two_stage=True,
         )
     elif image_size == 224:
         sam = Sam(

@@ -114,7 +114,8 @@ class MaskDecoder_512(nn.Module):
         interm_embeddings3: torch.Tensor,
         mode = 'train',
         gt=None,
-        img_size = 224
+        img_size = 224,
+        return_stage1_feats: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict masks given image and prompt embeddings.
@@ -151,12 +152,15 @@ class MaskDecoder_512(nn.Module):
             hq_features=hq_features,
             hq_features2=hq_features2,
             hq_features3=hq_features3,
-            mode = mode,
+            mode=mode,
             gt=gt,
-            img_size=img_size
+            img_size=img_size,
+            return_stage1_feats=return_stage1_feats,
         )
 
-        # Prepare output
+        if return_stage1_feats:
+            masks, iou_pred, attn_out, msk_feat, up_embed = masks
+            return masks, iou_pred, attn_out, msk_feat, up_embed
         return masks, iou_pred, attn_out
 
     def predict_masks(
@@ -170,7 +174,8 @@ class MaskDecoder_512(nn.Module):
         hq_features3: torch.Tensor,
         mode='train',
         gt=None,
-        img_size=224
+        img_size=224,
+        return_stage1_feats: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
         # Concatenate output tokens
@@ -230,10 +235,8 @@ class MaskDecoder_512(nn.Module):
 
         b, c, h, w = upscaled_embedding.shape  # [h, token_num, h, w]
         masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)  # [1, 4, 256, 256], 256 = 4 * 64, the size of image embeddings
-        # masks_sam = (hyper_in[:,:self.num_mask_tokens-1] @ upscaled_embedding_sam.view(b, c, h * w)).view(b, -1, h, w)
-        # masks_sam_hq = (hyper_in[:,self.num_mask_tokens-1:] @ upscaled_embedding_hq.view(b, c, h * w)).view(b, -1, h, w)
-        # masks = torch.cat([masks_sam,masks_sam_hq],dim=1)
-        # return masks, iou_pred, msk_feat, upscaled_embedding_hq
+        if return_stage1_feats:
+            return masks, iou_pred, att_out, msk_feat, upscaled_embedding.detach()
         return masks, iou_pred, att_out
 
 
@@ -274,6 +277,7 @@ class MaskDecoder2_512(nn.Module):
         activation: Type[nn.Module] = nn.GELU,
         iou_head_depth: int = 3,
         iou_head_hidden_dim: int = 256,
+        mvp_mode: bool = True,
     ) -> None:
         """
         Predicts masks given an image and prompt embeddings, using a
@@ -294,10 +298,10 @@ class MaskDecoder2_512(nn.Module):
         super().__init__()
         self.transformer_dim = transformer_dim
         self.transformer2 = transformer2
+        self.mvp_mode = mvp_mode
 
         self.num_multimask_outputs = num_multimask_outputs
 
-        # self.iou_token = nn.Embedding(1, transformer_dim)
         self.num_mask_tokens = num_multimask_outputs + 1
         self.mask_tokens = nn.Embedding(self.num_mask_tokens, transformer_dim)
 
@@ -316,6 +320,14 @@ class MaskDecoder2_512(nn.Module):
             LayerNorm2d(transformer_dim // 16),
             activation(),
         )
+        self.mvp_pixel_head = nn.Sequential(
+            nn.ConvTranspose2d(transformer_dim // 8, transformer_dim // 8, kernel_size=2, stride=2),
+            LayerNorm2d(transformer_dim // 8),
+            activation(),
+            nn.ConvTranspose2d(transformer_dim // 8, transformer_dim // 16, kernel_size=2, stride=2),
+            LayerNorm2d(transformer_dim // 16),
+            activation(),
+        )
         self.output_hypernetworks_mlps2 = nn.ModuleList(
             [
                 MLP(transformer_dim, transformer_dim, transformer_dim // 16, 5)
@@ -325,10 +337,6 @@ class MaskDecoder2_512(nn.Module):
 
         self.iou_prediction_head = MLP(
             transformer_dim, iou_head_hidden_dim, self.num_mask_tokens, iou_head_depth
-        )
-        self.med_sel = nn.Sequential(
-            nn.Linear(self.num_mask_tokens,self.num_mask_tokens),
-            nn.ReLU()
         )
 
         self.self_attn = Attention(
@@ -408,72 +416,38 @@ class MaskDecoder2_512(nn.Module):
         output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
 
-        # Expand per-image data in batch direction to be per-mask
-        src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
-        # src = src + dense_prompt_embeddings
         src = image_embeddings + dense_prompt_embeddings
         pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
         b, c, h, w = src.shape
 
-        # Run the transformer
-        if len(mask_feat.shape)==3:
+        if mask_feat.ndim == 3:
             mask_feat = mask_feat.unsqueeze(0)
+        if mask_feat.shape[-2] != h or mask_feat.shape[-1] != w:
+            mask_feat = F.interpolate(
+                mask_feat, size=(h, w), mode='bilinear', align_corners=False)
         mask_feat = self.softmax(mask_feat).flatten(start_dim=2)
-        flag_resize = 0
-        # if msk_feat.shape[-1] != 1024:
-        #     msk_feat = msk_feat.resize_(msk_feat.shape[-3], msk_feat.shape[-2],1024)
-        #     flag_resize = 1
-        
-        
-        if gt is not None:
-            gt_feat = gt.clone()
 
-        # CMAttn noise module
-        # if mode =='train':
-        #     msk_feat = torch.nn.Dropout(p=0.1, inplace=True)(msk_feat)
-        #     gt_feat = gt_feat.resize_(gt_feat.shape[0], h , w).int()
-        #     gt_feat = gt_feat.view(gt_feat.shape[0],h*w).unsqueeze(1)
-        #     gt_feat = gt_feat.repeat(1,9,1)
-        #     lab, cnts = torch.unique(gt_feat, sorted=True, return_counts=True)
-        #     unique = torch.stack((lab,cnts),dim=1)
-        #     unique_sorted, unique_ind = torch.sort(unique,dim=0)
-        #     noise_mean = torch.mean(msk_feat).cuda()
-        #     for i,cnt_ind in enumerate(unique_ind[:,1]):
-        #         var = noise_list[i]
-        #         noise = torch.randn((msk_feat.size())) * var 
-        #         noise = noise.cuda() + noise_mean
-        #         msk_feat[gt_feat==lab[cnt_ind]] = msk_feat[gt_feat==lab[cnt_ind]] + noise[gt_feat==lab[cnt_ind]]
-        msk_feat = self.self_attn(q=msk_feat, k=msk_feat, v=msk_feat)         
-           
+        use_cmattn = (not self.mvp_mode) and msk_feat is not None
+        if use_cmattn:
+            msk_feat = self.self_attn(q=msk_feat, k=msk_feat, v=msk_feat)
+            msk_feat = self.norm1(msk_feat)
+            msk_feat = self.self_attn2(q=msk_feat, k=msk_feat, v=msk_feat)
+            msk_feat = msk_feat + self.mlp(msk_feat)
+            msk_feat = self.norm2(msk_feat)
+            msk_feat = self.med_sel(msk_feat.transpose(-2, -1))
+            msk_feat = msk_feat.transpose(-1, -2).view(b, -1, h, w)
+            msk_feat = self.softmax(msk_feat)
+            src = src + torch.mul(src, msk_feat)
 
-        msk_feat = self.norm1(msk_feat)
-        
-        msk_feat = self.self_attn2(q=msk_feat, k=msk_feat, v=msk_feat)
-        msk_feat = msk_feat.clone()+self.mlp(msk_feat)
-        msk_feat = self.norm2(msk_feat)
-        print("self.num_mask_tokens:",self.num_mask_tokens)
-        print("msk_feat",msk_feat.shape)
-        print("tranpse",msk_feat.transpose( -2, -1).shape)
-        msk_feat = self.med_sel(msk_feat.transpose( -2, -1))
-        
-        # if flag_resize == 1:
-        #     msk_feat = msk_feat.resize_(msk_feat.shape[-3], 1024, msk_feat.shape[-1],)
-        #     flag_resize = 0
-        msk_feat = msk_feat.transpose(-1, -2).view(b, -1, h, w)
-        msk_feat = self.softmax(msk_feat)
+        hs, src, attn_out = self.transformer2(src, pos_src, tokens, mask_feat)
+        mask_tokens_out = hs[:, : self.num_mask_tokens, :]
 
-        # image embedding enhancement
-        src = src.clone() + torch.mul(src, msk_feat)
-
-        hs, src, attn_out= self.transformer2(src, pos_src, tokens, mask_feat)
-        iou_token_out = hs[:, 0, :]
-        # mask_tokens_out = hs[:, 1 : (1 + self.num_mask_tokens), :]
-        mask_tokens_out = hs[:, 0 : (1 + self.num_mask_tokens), :]
-
-        # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
         upscaled_embedding = self.output_upscaling(src)
-        upscaled_embedding = self.skip_connect(torch.cat((upscaled_embedding,up_embed),dim=1))
+        if self.mvp_mode or up_embed is None:
+            upscaled_embedding = self.mvp_pixel_head(upscaled_embedding)
+        else:
+            upscaled_embedding = self.skip_connect(torch.cat((upscaled_embedding, up_embed), dim=1))
         hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
             hyper_in_list.append(self.output_hypernetworks_mlps2[i](mask_tokens_out[:, i, :]))
@@ -482,8 +456,7 @@ class MaskDecoder2_512(nn.Module):
         b, c, h, w = upscaled_embedding.shape  # [h, token_num, h, w]
         masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)  # [1, 4, 256, 256], 256 = 4 * 64, the size of image embeddings
 
-        # Generate mask quality predictions
-        iou_pred = self.iou_prediction_head(iou_token_out)
+        iou_pred = self.iou_prediction_head(mask_tokens_out[:, 0, :])
 
         return masks, iou_pred, attn_out
 
