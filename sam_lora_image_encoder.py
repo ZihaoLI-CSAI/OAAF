@@ -137,10 +137,10 @@ class LoRA_Sam(nn.Module):
                 prompt_encoder_tensors[key] = value
             if 'prompt_encoder2' in key:
                 prompt_encoder2_tensors[key] = value
-            if 'mask_decoder' in key:
-                mask_decoder_tensors[key] = value
             if 'mask_decoder2' in key:
                 mask_decoder2_tensors[key] = value
+            elif 'mask_decoder' in key:
+                mask_decoder_tensors[key] = value
 
         merged_dict = {**a_tensors, **b_tensors, **prompt_encoder_tensors,**prompt_encoder2_tensors, **mask_decoder_tensors, **mask_decoder2_tensors}
         torch.save(merged_dict, filename)
@@ -177,7 +177,10 @@ class LoRA_Sam(nn.Module):
         sam_dict.update(prompt_encoder_new_state_dict)
 
         # load mask decoder
-        mask_decoder_keys = [k for k in sam_keys if 'mask_decoder' in k]
+        mask_decoder_keys = [
+            k for k in sam_keys if 'mask_decoder' in k and 'mask_decoder2' not in k
+        ]
+        mask_decoder_keys = [k for k in mask_decoder_keys if k in state_dict]
         mask_decoder_values = [state_dict[k] for k in mask_decoder_keys]
         mask_decoder_new_state_dict = {k: v for k, v in zip(mask_decoder_keys, mask_decoder_values)}
         sam_dict.update(mask_decoder_new_state_dict)

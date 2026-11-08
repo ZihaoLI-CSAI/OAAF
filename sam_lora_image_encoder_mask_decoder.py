@@ -303,7 +303,11 @@ class LoRA_Sam(nn.Module):
         sam_dict.update(prompt_encoder_new_state_dict)
 
         # load mask decoder
-        mask_decoder_keys = [k for k in sam_keys if 'mask_decoder' in k and 'transformer' not in k]
+        mask_decoder_keys = [
+            k for k in sam_keys
+            if 'mask_decoder' in k and 'mask_decoder2' not in k and 'transformer' not in k
+        ]
+        mask_decoder_keys = [k for k in mask_decoder_keys if k in state_dict]
         mask_decoder_values = [state_dict[k] for k in mask_decoder_keys]
         mask_decoder_new_state_dict = {k: v for k, v in zip(mask_decoder_keys, mask_decoder_values)}
         sam_dict.update(mask_decoder_new_state_dict)
