@@ -92,12 +92,31 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
     dataset_name = args.dataset
+    if dataset_name == 'ACDC':
+        # Slices are stored at 256. The 512 decoder resizes them, and test
+        # metrics are computed after the prediction is resized back to 256.
+        # num_classes 3 is background plus RV, myocardium and LV.
+        args.num_classes = 3
+        args.oversample_small_organs = 0
+        args.preserve_small_low_res = 0
+        args.use_class_weight_ce = 0
+        if args.list_dir.rstrip('/') == './lists/lists_Synapse':
+            args.list_dir = './lists/lists_ACDC'
+        if args.root_path == '/home/xrn/H-SAM-5-copy/data/train_npz':
+            args.root_path = './data/ACDC/train_npz'
+        if args.img_size != 512:
+            raise ValueError('ACDC on this branch requires --img_size 512')
     dataset_config = {
         'Synapse': {
             'root_path': args.root_path,
             'list_dir': args.list_dir,
             'num_classes': args.num_classes,
-        }
+        },
+        'ACDC': {
+            'root_path': args.root_path,
+            'list_dir': args.list_dir,
+            'num_classes': args.num_classes,
+        },
     }
     args.is_pretrain = True
     args.exp = dataset_name + '_' + str(args.img_size)
@@ -145,5 +164,5 @@ if __name__ == "__main__":
     with open(config_file, 'w') as f:
         f.writelines(config_items)
 
-    trainer = {'Synapse': trainer_synapse}
+    trainer = {'Synapse': trainer_synapse, 'ACDC': trainer_synapse}
     trainer[dataset_name](args, net, snapshot_path, multimask_output, low_res)

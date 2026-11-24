@@ -17,7 +17,10 @@ from datasets.dataset_synapse import Synapse_dataset
 from icecream import ic
 
 
-class_to_name = {1: 'spleen', 2: 'right kidney', 3: 'left kidney', 4: 'gallbladder', 5: 'liver', 6: 'stomach', 7: 'aorta', 8: 'pancreas'}
+CLASS_NAMES = {
+    'Synapse': {1: 'spleen', 2: 'right kidney', 3: 'left kidney', 4: 'gallbladder', 5: 'liver', 6: 'stomach', 7: 'aorta', 8: 'pancreas'},
+    'ACDC': {1: 'right ventricle', 2: 'myocardium', 3: 'left ventricle'},
+}
 
 
 def inference(args, multimask_output, db_config, model, test_save_path=None):
@@ -37,10 +40,11 @@ def inference(args, multimask_output, db_config, model, test_save_path=None):
             i_batch, case_name, np.mean(metric_i, axis=0)[0], np.mean(metric_i, axis=0)[1],np.mean(metric_i, axis=0)[2],np.mean(metric_i, axis=0)[3], np.mean(metric_i, axis=0)[4],np.mean(metric_i, axis=0)[5],np.mean(metric_i, axis=0)[6]))
     metric_list = metric_list / len(db_test)
     for i in range(1, args.num_classes + 1):
-        try:
-            logging.info('Mean class %d name %s mean_dice %f mean_hd95 %f mean_jaccard %f mean_asd %f mean_recall %f mean_specificity %f mean_precision %f' % (i, class_to_name[i], metric_list[i - 1][0], metric_list[i - 1][1],metric_list[i - 1][2],metric_list[i - 1][3],metric_list[i - 1][4],metric_list[i - 1][5],metric_list[i - 1][6]))
-        except:
+        class_name = CLASS_NAMES.get(args.dataset, {}).get(i)
+        if class_name is None:
             logging.info('Mean class %d mean_dice %f mean_hd95 %f mean_jaccard %f mean_asd %f mean_recall %f mean_specificity %f mean_precision %f' % (i, metric_list[i - 1][0], metric_list[i - 1][1],metric_list[i - 1][2],metric_list[i - 1][3],metric_list[i - 1][4],metric_list[i - 1][5],metric_list[i - 1][6]))
+        else:
+            logging.info('Mean class %d name %s mean_dice %f mean_hd95 %f mean_jaccard %f mean_asd %f mean_recall %f mean_specificity %f mean_precision %f' % (i, class_name, metric_list[i - 1][0], metric_list[i - 1][1],metric_list[i - 1][2],metric_list[i - 1][3],metric_list[i - 1][4],metric_list[i - 1][5],metric_list[i - 1][6]))
     performance = np.mean(metric_list, axis=0)[0]
     mean_hd95 = np.mean(metric_list, axis=0)[1]
     mean_jaccard=np.mean(metric_list, axis=0)[2]
@@ -145,6 +149,14 @@ if __name__ == '__main__':
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
     dataset_name = args.dataset
+    if dataset_name == 'ACDC':
+        args.num_classes = 3
+        if args.list_dir.rstrip('/') == './lists/lists_Synapse':
+            args.list_dir = './lists/lists_ACDC'
+        if args.volume_path.rstrip('/') == 'testset/test_vol_h5':
+            args.volume_path = './data/ACDC/test_vol_h5'
+        if args.img_size != 512 or args.input_size != 512:
+            raise ValueError('ACDC on this branch requires --img_size 512 --input_size 512')
     dataset_config = {
         'Synapse': {
             'Dataset': Synapse_dataset,
@@ -152,7 +164,14 @@ if __name__ == '__main__':
             'list_dir': args.list_dir,
             'num_classes': args.num_classes,
             'z_spacing': 1
-        }
+        },
+        'ACDC': {
+            'Dataset': Synapse_dataset,
+            'volume_path': args.volume_path,
+            'list_dir': args.list_dir,
+            'num_classes': args.num_classes,
+            'z_spacing': 1
+        },
     }
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
