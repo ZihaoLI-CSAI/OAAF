@@ -3,7 +3,8 @@
 The patient lists follow BCP. Each patient's two annotated frames are renamed
 frame01 and frame02 in increasing frame-number order. A volume is min-max
 normalized, then every slice is resized to 256x256. Training slices are written
-as npz files. Each test frame is written as one 3D npy.h5 volume.
+as npz files, numbered from slice_1 to match the BCP list. Each test frame is
+written as one 3D npy.h5 volume.
 
 Example:
     python datasets/prepare_acdc.py --src /path/to/ACDC/training --out ./data/ACDC
@@ -146,7 +147,8 @@ def main():
                     handle.create_dataset('image', data=image, compression='gzip')
                     handle.create_dataset('label', data=label, compression='gzip')
             for index in range(image.shape[0]):
-                slice_name = '%s_slice_%d' % (case, index)
+                # BCP numbers the first axial slice as slice_1.
+                slice_name = '%s_slice_%d' % (case, index + 1)
                 if slice_name not in train_set:
                     continue
                 np.savez(
