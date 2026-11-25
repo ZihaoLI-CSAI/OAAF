@@ -98,7 +98,11 @@ if __name__ == "__main__":
         # num_classes 3 is background plus RV, myocardium and LV.
         args.num_classes = 3
         args.oversample_small_organs = 0
-        args.preserve_small_low_res = 0
+        args.preserve_small_low_res = 1
+        # Myocardium overwrites a 4x4 block, then RV fills empty cells, then LV.
+        args.low_res_rare_classes = (2,)
+        args.low_res_common_classes = (1, 3)
+        args.acdc_geom_aug = 1
         args.use_class_weight_ce = 0
         if args.list_dir.rstrip('/') == './lists/lists_Synapse':
             args.list_dir = './lists/lists_ACDC'

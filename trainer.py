@@ -155,7 +155,10 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
                                transform=transforms.Compose(
                                    [RandomGenerator(output_size=[args.img_size, args.img_size],
                                                       low_res=[low_res, low_res],
-                                                      preserve_small_low_res=preserve_small)
+                                                      preserve_small_low_res=preserve_small,
+                                                      rare_classes=getattr(args, 'low_res_rare_classes', None),
+                                                      common_classes=getattr(args, 'low_res_common_classes', None),
+                                                      geom_aug=bool(getattr(args, 'acdc_geom_aug', 0)))
                                    ]))
     print("The length of train set is: {}".format(len(db_train)))
 
